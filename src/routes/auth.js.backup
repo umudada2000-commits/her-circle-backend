@@ -1,0 +1,246 @@
+import { Router } from "express";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import { z } from "zod";
+import rateLimit from "express-rate-limit";
+import mongoose from "mongoose";
+import User from "../models/User.js";
+import { generateOtp, hashOtp, verifyOtp } from "../utils/otp.js";
+import { sendOTP } from "../utils/notify.js";
+
+const router = Router();
+
+// Rate limiter: max 5 requests per IP per 10 minutes
+const authLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    message: "Too many attempts from this IP, please try again after 10 minutes",
+  },
+});
+
+// Helper for JWT Secret
+const getJwtSecret = () => {
+  const secret = process.env.JWT_SECRET;
+  if (!secret && process.env.NODE_ENV === "production") {
+    throw new Error("JWT_SECRET must be defined in production environment");
+  }
+  return secret || "her_circle_jwt_dev_secret";
+};
+
+// Zod validation schemas
+const signupSchema = z
+  .object({
+    email: z.string().email("Invalid email format").optional().or(z.literal("")),
+    phone: z.string().trim().min(5, "Phone number must be at least 5 characters").optional().or(z.literal("")),
+    password: z.string().min(8, "Password must be at least 8 characters long"),
+  })
+  .refine(
+    (data) => Boolean((data.email && data.email.trim()) || (data.phone && data.phone.trim())),
+    {
+      message: "At least one of email or phone is required",
+      path: ["identifier"],
+    }
+  );
+
+const verifyOtpSchema = z.object({
+  userId: z.string().trim().min(1, "userId is required"),
+  otp: z.coerce.string().trim().regex(/^\d{6}$/, "OTP must be a 6-digit numeric string"),
+});
+
+const loginSchema = z.object({
+  identifier: z.string().trim().min(1, "Identifier (email or phone) is required"),
+  password: z.string().min(1, "Password is required"),
+});
+
+/**
+ * POST /signup
+ * Body: { email?, phone?, password }
+ * Rate-limited: max 5 requests / IP / 10 min
+ */
+router.post("/signup", authLimiter, async (req, res) => {
+  try {
+    const validation = signupSchema.safeParse(req.body);
+    if (!validation.success) {
+      return res.status(400).json({
+        message: "Validation error",
+        errors: validation.error.flatten().fieldErrors,
+      });
+    }
+
+    const { email, phone, password } = validation.data;
+    const cleanEmail = email && email.trim() ? email.toLowerCase().trim() : undefined;
+    const cleanPhone = phone && phone.trim() ? phone.trim() : undefined;
+
+    // Check if user already exists
+    const queryConditions = [];
+    if (cleanEmail) queryConditions.push({ email: cleanEmail });
+    if (cleanPhone) queryConditions.push({ phone: cleanPhone });
+
+    const existingUser = await User.findOne({ $or: queryConditions });
+
+    if (existingUser && existingUser.isVerified) {
+      return res.status(409).json({ message: "User already exists and is verified" });
+    }
+
+    // Hash password and prepare OTP (10 min expiry)
+    const passwordHash = await bcrypt.hash(password, 10);
+    const otp = generateOtp();
+    const otpHash = await hashOtp(otp);
+    const otpExpires = new Date(Date.now() + 10 * 60 * 1000);
+
+    let user = existingUser;
+    if (user) {
+      // Re-signup for unverified user
+      user.passwordHash = passwordHash;
+      user.otpHash = otpHash;
+      user.otpExpires = otpExpires;
+      if (cleanEmail) user.email = cleanEmail;
+      if (cleanPhone) user.phone = cleanPhone;
+      await user.save();
+    } else {
+      user = new User({
+        ...(cleanEmail ? { email: cleanEmail } : {}),
+        ...(cleanPhone ? { phone: cleanPhone } : {}),
+        passwordHash,
+        otpHash,
+        otpExpires,
+      });
+      await user.save();
+    }
+
+    // Deliver OTP via email / SMS
+    await sendOTP({ email: cleanEmail, phone: cleanPhone }, otp);
+
+    return res.status(201).json({ userId: user._id });
+  } catch (error) {
+    console.error("[POST /signup] Error:", error.message);
+    return res.status(500).json({ message: error.message || "Failed to process signup" });
+  }
+});
+
+/**
+ * POST /verify-otp
+ * Body: { userId, otp }
+ * Rate-limited: max 5 requests / IP / 10 min
+ */
+router.post("/verify-otp", authLimiter, async (req, res) => {
+  try {
+    const validation = verifyOtpSchema.safeParse(req.body);
+    if (!validation.success) {
+      return res.status(400).json({
+        message: "Validation error",
+        errors: validation.error.flatten().fieldErrors,
+      });
+    }
+
+    const { userId, otp } = validation.data;
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Check expiry
+    if (!user.otpExpires || user.otpExpires < new Date()) {
+      return res.status(400).json({ message: "OTP expired" });
+    }
+
+    // Verify OTP hash
+    if (!user.otpHash) {
+      return res.status(400).json({ message: "Invalid OTP" });
+    }
+
+    const isValid = await verifyOtp(otp, user.otpHash);
+    if (!isValid) {
+      return res.status(400).json({ message: "Invalid OTP" });
+    }
+
+    // Verification successful: clear OTP data and activate account
+    user.isVerified = true;
+    user.otpHash = undefined;
+    user.otpExpires = undefined;
+    await user.save();
+
+    // Generate JWT
+    const token = jwt.sign(
+      { id: user._id, role: user.role },
+      getJwtSecret(),
+      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
+    );
+
+    return res.json({
+      token,
+      user: {
+        id: user._id,
+        role: user.role,
+        isVerified: user.isVerified,
+      },
+    });
+  } catch (error) {
+    console.error("[POST /verify-otp] Error:", error.message);
+    return res.status(500).json({ message: error.message || "Failed to verify OTP" });
+  }
+});
+
+/**
+ * POST /login
+ * Body: { identifier, password }
+ */
+router.post("/login", async (req, res) => {
+  try {
+    const validation = loginSchema.safeParse(req.body);
+    if (!validation.success) {
+      return res.status(400).json({
+        message: "Validation error",
+        errors: validation.error.flatten().fieldErrors,
+      });
+    }
+
+    const { identifier, password } = validation.data;
+    const cleanIdentifier = identifier.trim();
+
+    const user = await User.findOne({
+      $or: [
+        { email: cleanIdentifier.toLowerCase() },
+        { phone: cleanIdentifier },
+      ],
+    });
+
+    if (!user || !user.isVerified) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.passwordHash);
+    if (!isMatch) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    const token = jwt.sign(
+      { id: user._id, role: user.role },
+      getJwtSecret(),
+      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
+    );
+
+    return res.json({
+      token,
+      user: {
+        id: user._id,
+        role: user.role,
+      },
+    });
+  } catch (error) {
+    console.error("[POST /login] Error:", error.message);
+    return res.status(500).json({ message: error.message || "Failed to log in" });
+  }
+});
+
+export { router };
+export default router;
+
